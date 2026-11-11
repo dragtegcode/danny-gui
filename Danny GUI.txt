@@ -6086,6 +6086,10 @@ local function triggerFailsafe(player, reason)
 	setToggle(MainToggle, MainKnob, false)
 	releaseF()
 	clearAll()
+	-- Write macro=false to disk NOW so a kick/hop/rejoin never auto-restarts farm
+	pcall(function()
+		if Settings.save then Settings.save() end
+	end)
 
 	local actionText = (mode == "kick" and "Kicking you") or (mode == "hop" and "Server hopping") or "Clicking Menu"
 	TrackerText.Text = "FAILSAFE: " .. why .. "\n" .. actionText
@@ -10609,7 +10613,7 @@ Settings.snapshot = function()
 		noFallDamage = HK.nofall.on == true,
 		fly = HK.fly.on == true,
 		flySpeed = HK.fly.speed,
-		macro = MacroActive == true,
+		macro = false, -- never restore farm across sessions (kick/leave resets it)
 		playerEspRange = PlayerEspRange,
 		extras = (Settings.DX.getSave and Settings.DX.getSave()) or nil,
 		espShowName = EspOpts.name,
@@ -10655,10 +10659,10 @@ Settings.save = function()
 end
 
 env.DannyGuiStop = function()
-	pcall(function() Settings.save() end)
-	Settings.stopped = true
 	MacroActive = false
 	runId = runId + (1)
+	Settings.stopped = true
+	pcall(function() Settings.save() end)
 	pcall(releaseF)
 	pcall(clearAll)
 	pcall(clearEsp)
@@ -11001,15 +11005,8 @@ do
 			end)
 		end
 		if data.fly == true then whenReady(function() HK.fly.set(true) end) end
-		if data.macro == true then
-			whenReady(function()
-				if MacroActive then return end
-				MacroActive = true
-				setToggle(MainToggle, MainKnob, true)
-				clearEsp()
-				runKeyLoop()
-			end)
-		end
+		-- Fruit farm is session-only: never auto-start after kick / leave / rejoin
+		-- (old saves may still have macro=true; ignore it)
 	end
 end
 -- ====================== BOSSES: home box + Bosses page + live tracker ======================
