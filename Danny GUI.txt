@@ -90,20 +90,21 @@ Settings.DX = {sellBusy = false, clicked = setmetatable({}, {__mode = "k"})}
 --  * readJson falls back to the .bak copy if the main file is missing / corrupted
 Settings.readJson = function(path)
 	local result
-	-- 1) disk
 	pcall(function()
-		if not (isfile and readfile) then return end
-		for _, f in ipairs({path, path .. ".bak"}) do
-			if isfile(f) then
-				local ok, d = pcall(function() return game:GetService("HttpService"):JSONDecode(readfile(f)) end)
-				if ok and type(d) == "table" then result = d return end
+		local isf, rf = isfile, readfile
+		if isf and rf then
+			for _, f in ipairs({path, path .. ".bak"}) do
+				if isf(f) then
+					local ok, d = pcall(function() return game:GetService("HttpService"):JSONDecode(rf(f)) end)
+					if ok and type(d) == "table" then result = d return end
+				end
 			end
 		end
 	end)
-	-- 2) in-memory / getgenv backup (works on Xeno when writefile is missing)
 	if not result then
 		pcall(function()
-			local bag = (env and env._DannyGuiFiles) or (_G and _G._DannyGuiFiles)
+			local ge = (getgenv and getgenv()) or _G
+			local bag = ge and ge._DannyGuiFiles
 			if type(bag) == "table" and type(bag[path]) == "string" then
 				local ok, d = pcall(function() return game:GetService("HttpService"):JSONDecode(bag[path]) end)
 				if ok and type(d) == "table" then result = d end
@@ -114,29 +115,24 @@ Settings.readJson = function(path)
 end
 Settings.writeJson = function(path, tbl)
 	local wrote = false
-	local text
 	pcall(function()
-		local ok, t = pcall(function() return game:GetService("HttpService"):JSONEncode(tbl) end)
-		if not ok or type(t) ~= "string" or t == "" then return end
-		text = t
-		-- always keep a getgenv/_G copy so QOL settings survive re-execute even without writefile
-		local bag = env._DannyGuiFiles
-		if type(bag) ~= "table" then
-			bag = {}
-			env._DannyGuiFiles = bag
-			pcall(function() if _G then _G._DannyGuiFiles = bag end end)
-		end
-		bag[path] = text
+		local ok, text = pcall(function() return game:GetService("HttpService"):JSONEncode(tbl) end)
+		if not ok or type(text) ~= "string" or text == "" then return end
+		local ge = (getgenv and getgenv()) or _G
+		ge._DannyGuiFiles = ge._DannyGuiFiles or {}
+		ge._DannyGuiFiles[path] = text
 		wrote = true
-		-- also try real filesystem when the executor supports it
-		if writefile then
+		local wf = writefile or (ge and (ge.writefile or ge.writefileasync))
+		local rf = readfile or (ge and ge.readfile)
+		local isf = isfile or (ge and ge.isfile)
+		if wf then
 			pcall(function()
-				if isfile and readfile and isfile(path) then
-					local old = readfile(path)
-					if type(old) == "string" and old ~= "" and old ~= text then writefile(path .. ".bak", old) end
+				if isf and rf and isf(path) then
+					local old = rf(path)
+					if type(old) == "string" and old ~= "" and old ~= text then pcall(wf, path .. ".bak", old) end
 				end
 			end)
-			pcall(function() writefile(path, text) end)
+			pcall(wf, path, text)
 		end
 	end)
 	return wrote
@@ -2419,7 +2415,7 @@ local function __danny_build_mid()
 	end
 
 	-- ---------- INF ZOOM (sits right above Inf Jump) ----------
-	for _, ch in ipairs(QOLContent:GetChildren()) do
+	for _, ch in ipairs((QOLContent and QOLContent:GetChildren()) or {}) do
 		if ch:IsA("GuiObject") and ch.LayoutOrder >= 5 and ch.LayoutOrder < 20 then ch.LayoutOrder = ch.LayoutOrder + 1 end
 	end
 	HK.infzoom.card, HK.infzoom.toggle, HK.infzoom.knob = createToggleCard(5, "🔭", 18, "Inf Zoom", "Unlimited camera zoom")
@@ -2517,7 +2513,7 @@ local function __danny_build_mid()
 	addHotkeySection(HK.infzoom.card, HK.infzoom.toggle, "🔭", HK.infzoom, 100)
 
 	-- ---------- NO FALL DAMAGE (sits right under Inf Zoom) ----------
-	for _, ch in ipairs(QOLContent:GetChildren()) do
+	for _, ch in ipairs((QOLContent and QOLContent:GetChildren()) or {}) do
 		if ch:IsA("GuiObject") and ch.LayoutOrder >= 6 and ch.LayoutOrder < 20 then ch.LayoutOrder = ch.LayoutOrder + 1 end
 	end
 	HK.nofall.card, HK.nofall.toggle, HK.nofall.knob = createToggleCard(6, "🪂", 18, "NoFallDamage", "No fall damage from any height")
@@ -5493,17 +5489,17 @@ initTeleportSpectatePage()
 
 end -- __danny_build_mid
 
--- Xeno-friendly: build mid UI off the main thread so execute doesn't freeze
+-- Build mid UI now (must finish before extras/teleports — prevents missing pages)
 Settings._midReady = false
-task.spawn(function()
-	task.wait(0.05)
+do
 	local okMid, errMid = pcall(__danny_build_mid)
 	if not okMid then
 		warn("[DannyGui] mid build error: " .. tostring(errMid))
 	end
 	Settings._midReady = true
 	Settings._allowEarlySave = true
-end)
+end
+
 
 local Tab = Instance.new("TextButton")
 
@@ -6110,7 +6106,6 @@ local function triggerFailsafe(player, reason)
 	setToggle(MainToggle, MainKnob, false)
 	releaseF()
 	clearAll()
-	pcall(function() if Settings.save then Settings.save() end end)
 
 	local actionText = (mode == "kick" and "Kicking you") or (mode == "hop" and "Server hopping") or "Clicking Menu"
 	TrackerText.Text = "FAILSAFE: " .. why .. "\n" .. actionText
@@ -7299,6 +7294,17 @@ HK.light.action = function() HK.light.set(not HK.light.on) end
 -- Everything below is wrapped in a pcall: if anything here ever errors, the rest of the GUI still loads.
 xpcall(function()
 
+-- Teleports + QOL extras need mid UI finished
+do
+	local t0 = os.clock()
+	while QOLContent == nil and os.clock() - t0 < 15 do
+		task.wait(0.05)
+	end
+	if QOLContent == nil then
+		error("QOLContent missing — mid UI did not build")
+	end
+end
+
 local Lighting = game:GetService("Lighting")
 local FONT_B = Enum.Font.SourceSansSemibold
 local FONT = Enum.Font.SourceSans
@@ -7861,7 +7867,7 @@ end
 
 do
 	-- make room: everything on the QOL page from order 4 up (Let There Be Light, Inf Jump, Fly, Noclip) moves down one
-	for _, ch in ipairs(QOLContent:GetChildren()) do
+	for _, ch in ipairs((QOLContent and QOLContent:GetChildren()) or {}) do
 		if ch:IsA("GuiObject") and ch.LayoutOrder >= 4 and ch.LayoutOrder < 20 then
 			ch.LayoutOrder = ch.LayoutOrder + 1
 		end
@@ -7918,7 +7924,7 @@ pcall(function()
 
 	-- take Let There Be Light's slot; it (and everything below it) moves down one
 	local slot = (HK.light and HK.light.card and HK.light.card.LayoutOrder) or 5
-	for _, ch in ipairs(QOLContent:GetChildren()) do
+	for _, ch in ipairs((QOLContent and QOLContent:GetChildren()) or {}) do
 		if ch:IsA("GuiObject") and ch.LayoutOrder >= slot and ch.LayoutOrder < 20 then
 			ch.LayoutOrder = ch.LayoutOrder + 1
 		end
@@ -8624,7 +8630,6 @@ if not TeleportsPage then
 	TeleportsPage.Size = UDim2.new(1, 0, 1, 0)
 	TeleportsPage.Position = UDim2.new(1, 0, 0, 0)
 	TeleportsPage.BackgroundTransparency = 1
-	TeleportsPage.BorderSizePixel = 0
 	TeleportsPage.Visible = false
 	TeleportsPage.Parent = Pages
 end
@@ -10063,7 +10068,7 @@ pcall(function()
 		pcall(function()
 			local abCard = nil
 			local serverCard = nil
-			for _, ch in ipairs(QOLContent:GetChildren()) do
+			for _, ch in ipairs((QOLContent and QOLContent:GetChildren()) or {}) do
 				if ch:IsA("GuiObject") then
 					for _, d in ipairs(ch:GetDescendants()) do
 						if d:IsA("TextLabel") then
@@ -10099,7 +10104,7 @@ pcall(function()
 
 	-- sit right under the Fly card (everything below moves down one)
 	local fo = (HK.fly and HK.fly.card and HK.fly.card.LayoutOrder) or 7
-	for _, ch in ipairs(QOLContent:GetChildren()) do
+	for _, ch in ipairs((QOLContent and QOLContent:GetChildren()) or {}) do
 		if ch:IsA("GuiObject") and ch.LayoutOrder > fo and ch.LayoutOrder < 20 then ch.LayoutOrder = ch.LayoutOrder + 1 end
 	end
 	local card = createCard(300, fo + 1, QOLContent)
@@ -10302,7 +10307,7 @@ pcall(function()
 
 	-- sit right above "Auto Byakugan Blocks" (right under Fly); everything below moves down one
 	local fo = (HK.fly and HK.fly.card and HK.fly.card.LayoutOrder) or 7
-	for _, ch in ipairs(QOLContent:GetChildren()) do
+	for _, ch in ipairs((QOLContent and QOLContent:GetChildren()) or {}) do
 		if ch:IsA("GuiObject") and ch.LayoutOrder > fo and ch.LayoutOrder < 20 then ch.LayoutOrder = ch.LayoutOrder + 1 end
 	end
 	local card = createCard(290, fo + 1, QOLContent)
@@ -10625,52 +10630,58 @@ antiSw.set(true)
 end, function(errX)
 	warn("[DannyGui] extras failed to load: " .. tostring(errX))
 	print("[DannyGui] extras failed to load: " .. tostring(errX))
-	print("[DannyGui] (teleports / waypoints / some QOL extras may be missing)")
 end)
 
 -- ====================== SAVED SETTINGS ======================
 Settings.snapshot = function()
+	local function safeCall(fn)
+		if type(fn) ~= "function" then return nil end
+		local ok, v = pcall(fn)
+		if ok then return v end
+		return nil
+	end
+	local function on(t)
+		return type(t) == "table" and t.on == true
+	end
 	local snap = {
-		summonKey = SummonKey.Name,
+		summonKey = (SummonKey and SummonKey.Name) or nil,
 		failsafe = FailsafeMode,
-		fruitEsp = ESPEnabled,
-		playerEsp = PlayerEspEnabled,
-		noclip = HK.noclip.on == true,
-		nofog = HK.nofog.on == true,
-		light = HK.light.on == true,
-		lightLevel = HK.light.level,
-		infJump = HK.infjump.on == true,
-		infJumpMode = HK.infjump.mode,
-		infZoom = HK.infzoom.on == true,
-		infZoomMode = HK.infzoom.mode,
-		noFallDamage = HK.nofall.on == true,
-		fly = HK.fly.on == true,
-		flySpeed = HK.fly.speed,
-		macro = false, -- session-only: never restore farm after kick/leave
+		fruitEsp = ESPEnabled == true,
+		playerEsp = PlayerEspEnabled == true,
+		noclip = on(HK.noclip),
+		nofog = on(HK.nofog),
+		light = on(HK.light),
+		lightLevel = (HK.light and HK.light.level) or nil,
+		infJump = on(HK.infjump),
+		infJumpMode = (HK.infjump and HK.infjump.mode) or nil,
+		infZoom = on(HK.infzoom),
+		infZoomMode = (HK.infzoom and HK.infzoom.mode) or nil,
+		noFallDamage = on(HK.nofall),
+		fly = on(HK.fly),
+		flySpeed = (HK.fly and HK.fly.speed) or nil,
+		macro = false,
 		playerEspRange = PlayerEspRange,
-		extras = (Settings.DX.getSave and Settings.DX.getSave()) or nil,
-		espShowName = EspOpts.name,
-		espShowOutline = EspOpts.outline,
-		espShowStuds = EspOpts.studs,
-		espShowHealth = EspOpts.health,
-		espShowTeam = EspOpts.team,
+		extras = safeCall(Settings.DX and Settings.DX.getSave),
+		espShowName = EspOpts and EspOpts.name == true,
+		espShowOutline = EspOpts and EspOpts.outline == true,
+		espShowStuds = EspOpts and EspOpts.studs == true,
+		espShowHealth = EspOpts and EspOpts.health == true,
+		espShowTeam = EspOpts and EspOpts.team == true,
 		keys = {
-			esp = HK.esp.key and HK.esp.key.Name or nil,
-			fly = HK.fly.key and HK.fly.key.Name or nil,
-			noclip = HK.noclip.key and HK.noclip.key.Name or nil,
-			nofog = HK.nofog.key and HK.nofog.key.Name or nil,
-			infjump = HK.infjump.key and HK.infjump.key.Name or nil,
-			infzoom = HK.infzoom.key and HK.infzoom.key.Name or nil,
-			nofall = HK.nofall.key and HK.nofall.key.Name or nil,
-			light = HK.light.key and HK.light.key.Name or nil,
+			esp = HK.esp and HK.esp.key and HK.esp.key.Name or nil,
+			fly = HK.fly and HK.fly.key and HK.fly.key.Name or nil,
+			noclip = HK.noclip and HK.noclip.key and HK.noclip.key.Name or nil,
+			nofog = HK.nofog and HK.nofog.key and HK.nofog.key.Name or nil,
+			infjump = HK.infjump and HK.infjump.key and HK.infjump.key.Name or nil,
+			infzoom = HK.infzoom and HK.infzoom.key and HK.infzoom.key.Name or nil,
+			nofall = HK.nofall and HK.nofall.key and HK.nofall.key.Name or nil,
+			light = HK.light and HK.light.key and HK.light.key.Name or nil,
 		},
-		ab = Settings.ABsave and Settings.ABsave.get() or nil,
-		bb = Settings.BBsave and Settings.BBsave.get() or nil,
-		bp = Settings.BPsave and Settings.BPsave.get() or nil,
-		av = Settings.AVsave and Settings.AVsave.get() or nil,
+		ab = safeCall(Settings.ABsave and Settings.ABsave.get),
+		bb = safeCall(Settings.BBsave and Settings.BBsave.get),
+		bp = safeCall(Settings.BPsave and Settings.BPsave.get),
+		av = safeCall(Settings.AVsave and Settings.AVsave.get),
 	}
-	-- anything that exists in the last saved file but could not be read this session (a block failed to
-	-- load, a future field...) is carried over, so a partial load can never wipe saved settings
 	local prev = Settings.prevData
 	if type(prev) == "table" then
 		for k, v in pairs(prev) do
@@ -10679,38 +10690,40 @@ Settings.snapshot = function()
 	end
 	return snap
 end
-
 Settings.save = function()
 	if Settings.stopped then return end
-	-- allow saves once the shell exists; only skip during the very first construction frames
 	if Settings.loading and not Settings._allowEarlySave then return end
 	pcall(function()
 		local ok, snap = pcall(Settings.snapshot)
 		if not ok or type(snap) ~= "table" then return end
 		local ok2, text = pcall(function() return HttpService:JSONEncode(snap) end)
-		if not ok2 or text == Settings.lastText then return end
-		if Settings.writeJson(Settings.file, snap) then Settings.lastText = text end
+		if not ok2 or type(text) ~= "string" then return end
+		if text == Settings.lastText then return end
+		if Settings.writeJson(Settings.file, snap) then
+			Settings.lastText = text
+			Settings.prevData = snap
+		end
 	end)
 end
 
 env.DannyGuiStop = function()
+	Settings.stopped = true
 	MacroActive = false
 	runId = runId + (1)
-	Settings.stopped = true
-	pcall(function() Settings.save() end)
 	pcall(releaseF)
 	pcall(clearAll)
 	pcall(clearEsp)
 	pcall(clearPlayerEsp)
 	pcall(clearNoclip)
 	pcall(clearNofog)
-	pcall(HK.light.clear)
-	pcall(HK.infjump.clear)
-	pcall(HK.infzoom.clear)
-	pcall(HK.nofall.clear)
-	pcall(HK.fly.clear)
+	pcall(function() if HK.light and HK.light.clear then HK.light.clear() end end)
+	pcall(function() if HK.infjump and HK.infjump.clear then HK.infjump.clear() end end)
+	pcall(function() if HK.infzoom and HK.infzoom.clear then HK.infzoom.clear() end end)
+	pcall(function() if HK.nofall and HK.nofall.clear then HK.nofall.clear() end end)
+	pcall(function() if HK.fly and HK.fly.clear then HK.fly.clear() end end)
 	pcall(clearHotkeys)
-	if Settings.DX.stop then pcall(Settings.DX.stop) end
+	if Settings.DX and Settings.DX.stop then pcall(Settings.DX.stop) end
+	-- toggles already saved on each click; don't force a risky save during teardown
 end
 
 -- ====================== BUTTONS ======================
@@ -11013,15 +11026,23 @@ do
 			setPlayerEsp(true)
 			setToggle(PlayerEspToggle, PlayerEspKnob, true)
 		end
-		if data.noclip == true then setNoclip(true) end
-		if data.nofog == true then setNofog(true) end
-		if tonumber(data.lightLevel) then HK.light.setLevel(tonumber(data.lightLevel), true) end
-		if data.light == true then HK.light.set(true) end
-		if data.infJumpMode == "tap" or data.infJumpMode == "hold" then HK.infjump.setMode(data.infJumpMode, true) end
-		if data.infJump == true then HK.infjump.set(true) end
-		if data.infZoomMode == "normal" or data.infZoomMode == "walls" then HK.infzoom.setMode(data.infZoomMode, true) end
-		if data.infZoom == true then HK.infzoom.set(true) end
-		if data.noFallDamage == true then HK.nofall.set(true) end
+		task.spawn(function()
+			task.wait(0.1)
+			if data.noclip == true then pcall(setNoclip, true) end
+			task.wait()
+			if data.nofog == true then pcall(setNofog, true) end
+			task.wait()
+			if tonumber(data.lightLevel) then pcall(function() HK.light.setLevel(tonumber(data.lightLevel), true) end) end
+			if data.light == true then pcall(function() HK.light.set(true) end) end
+			task.wait()
+			if data.infJumpMode == "tap" or data.infJumpMode == "hold" then pcall(function() HK.infjump.setMode(data.infJumpMode, true) end) end
+			if data.infJump == true then pcall(function() HK.infjump.set(true) end) end
+			task.wait()
+			if data.infZoomMode == "normal" or data.infZoomMode == "walls" then pcall(function() HK.infzoom.setMode(data.infZoomMode, true) end) end
+			if data.infZoom == true then pcall(function() HK.infzoom.set(true) end) end
+			task.wait()
+			if data.noFallDamage == true then pcall(function() HK.nofall.set(true) end) end
+		end)
 		if type(data.extras) == "table" and Settings.DX.applySave then pcall(Settings.DX.applySave, data.extras) end
 		if type(data.ab) == "table" and Settings.ABsave then pcall(Settings.ABsave.apply, data.ab) end
 		if type(data.bb) == "table" and Settings.BBsave then pcall(Settings.BBsave.apply, data.bb) end
@@ -11040,7 +11061,8 @@ do
 			end)
 		end
 		if data.fly == true then whenReady(function() HK.fly.set(true) end) end
-		-- Fruit farm is session-only (ignore saved macro after kick/leave/rejoin)
+		-- farm is session-only
+
 	end
 end
 -- ====================== BOSSES: home box + Bosses page + live tracker ======================
@@ -11762,7 +11784,6 @@ xpcall(function()
 	local cards = {}
 	local function buildBossCard(i, b)
 		local card = createCard(CARD_H, (b.group == "beast" and 200 or 10) + i, BossesScroll)
-		if Settings.themeSubtree then pcall(Settings.themeSubtree, card) end
 		local c = { card = card, kind = nil, expanded = false }
 
 		-- status dot (LEFT of the name) with a soft pulsing halo
@@ -12924,7 +12945,6 @@ xpcall(function()
 	local function buildQuestCard(i, q)
 		local orderBase = (q.cat == "One-time" and 10) or (q.cat == "Repeatable" and 100) or (q.sec == "quest" and 1000) or (q.sec == "train" and 2000) or (q.sec == "shop" and 3000) or (q.cat == "Clan Progression" and 150) or (q.cat == "Boss Access" and 200) or (q.cat == "Clan" and 300) or 400
 		local card = createCard(CARD_H, orderBase + i, QuestsScroll)
-		if Settings.themeSubtree then pcall(Settings.themeSubtree, card) end
 		local c = { card = card, expanded = false }
 		local SIMPLE = not SHOW_SETUP_UI
 		local WPL = q.setup and "SET WP" or "SET MARKER"
@@ -13695,10 +13715,6 @@ xpcall(function()
 				end
 				if i % 3 == 0 then task.wait() end
 			end
-			task.wait(0.05)
-			pcall(function()
-				if refreshGuiLook then refreshGuiLook() end
-			end)
 		end)
 	end
 	Settings._ensureQuestCards = ensureQuestCards
