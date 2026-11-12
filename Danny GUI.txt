@@ -90,6 +90,7 @@ Settings.DX = {sellBusy = false, clicked = setmetatable({}, {__mode = "k"})}
 --  * readJson falls back to the .bak copy if the main file is missing / corrupted
 Settings.readJson = function(path)
 	local result
+	-- 1) disk
 	pcall(function()
 		if not (isfile and readfile) then return end
 		for _, f in ipairs({path, path .. ".bak"}) do
@@ -99,22 +100,44 @@ Settings.readJson = function(path)
 			end
 		end
 	end)
+	-- 2) in-memory / getgenv backup (works on Xeno when writefile is missing)
+	if not result then
+		pcall(function()
+			local bag = (env and env._DannyGuiFiles) or (_G and _G._DannyGuiFiles)
+			if type(bag) == "table" and type(bag[path]) == "string" then
+				local ok, d = pcall(function() return game:GetService("HttpService"):JSONDecode(bag[path]) end)
+				if ok and type(d) == "table" then result = d end
+			end
+		end)
+	end
 	return result
 end
 Settings.writeJson = function(path, tbl)
 	local wrote = false
+	local text
 	pcall(function()
-		if not writefile then return end
-		local ok, text = pcall(function() return game:GetService("HttpService"):JSONEncode(tbl) end)
-		if not ok or type(text) ~= "string" or text == "" then return end
-		pcall(function()
-			if isfile and readfile and isfile(path) then
-				local old = readfile(path)
-				if type(old) == "string" and old ~= "" and old ~= text then writefile(path .. ".bak", old) end
-			end
-		end)
-		writefile(path, text)
+		local ok, t = pcall(function() return game:GetService("HttpService"):JSONEncode(tbl) end)
+		if not ok or type(t) ~= "string" or t == "" then return end
+		text = t
+		-- always keep a getgenv/_G copy so QOL settings survive re-execute even without writefile
+		local bag = env._DannyGuiFiles
+		if type(bag) ~= "table" then
+			bag = {}
+			env._DannyGuiFiles = bag
+			pcall(function() if _G then _G._DannyGuiFiles = bag end end)
+		end
+		bag[path] = text
 		wrote = true
+		-- also try real filesystem when the executor supports it
+		if writefile then
+			pcall(function()
+				if isfile and readfile and isfile(path) then
+					local old = readfile(path)
+					if type(old) == "string" and old ~= "" and old ~= text then writefile(path .. ".bak", old) end
+				end
+			end)
+			pcall(function() writefile(path, text) end)
+		end
 	end)
 	return wrote
 end
@@ -5479,6 +5502,7 @@ task.spawn(function()
 		warn("[DannyGui] mid build error: " .. tostring(errMid))
 	end
 	Settings._midReady = true
+	Settings._allowEarlySave = true
 end)
 
 local Tab = Instance.new("TextButton")
@@ -6086,10 +6110,7 @@ local function triggerFailsafe(player, reason)
 	setToggle(MainToggle, MainKnob, false)
 	releaseF()
 	clearAll()
-	-- Write macro=false to disk NOW so a kick/hop/rejoin never auto-restarts farm
-	pcall(function()
-		if Settings.save then Settings.save() end
-	end)
+	pcall(function() if Settings.save then Settings.save() end end)
 
 	local actionText = (mode == "kick" and "Kicking you") or (mode == "hop" and "Server hopping") or "Clicking Menu"
 	TrackerText.Text = "FAILSAFE: " .. why .. "\n" .. actionText
@@ -8597,6 +8618,17 @@ end, function(e) warn("[DannyGui] hotkey popups error: " .. tostring(e)) end)
 local spotsCard
 do
 local TeleportsPage = Pages:FindFirstChild("TeleportsPage")
+if not TeleportsPage then
+	TeleportsPage = Instance.new("Frame")
+	TeleportsPage.Name = "TeleportsPage"
+	TeleportsPage.Size = UDim2.new(1, 0, 1, 0)
+	TeleportsPage.Position = UDim2.new(1, 0, 0, 0)
+	TeleportsPage.BackgroundTransparency = 1
+	TeleportsPage.BorderSizePixel = 0
+	TeleportsPage.Visible = false
+	TeleportsPage.Parent = Pages
+end
+pageFrames.teleports = TeleportsPage
 local teleBack = Instance.new("TextButton")
 teleBack.Size = UDim2.new(0, 74, 0, 24)
 teleBack.Position = UDim2.new(0, 16, 0, 14)
@@ -10593,6 +10625,7 @@ antiSw.set(true)
 end, function(errX)
 	warn("[DannyGui] extras failed to load: " .. tostring(errX))
 	print("[DannyGui] extras failed to load: " .. tostring(errX))
+	print("[DannyGui] (teleports / waypoints / some QOL extras may be missing)")
 end)
 
 -- ====================== SAVED SETTINGS ======================
@@ -10613,7 +10646,7 @@ Settings.snapshot = function()
 		noFallDamage = HK.nofall.on == true,
 		fly = HK.fly.on == true,
 		flySpeed = HK.fly.speed,
-		macro = false, -- never restore farm across sessions (kick/leave resets it)
+		macro = false, -- session-only: never restore farm after kick/leave
 		playerEspRange = PlayerEspRange,
 		extras = (Settings.DX.getSave and Settings.DX.getSave()) or nil,
 		espShowName = EspOpts.name,
@@ -10648,12 +10681,14 @@ Settings.snapshot = function()
 end
 
 Settings.save = function()
-	if Settings.loading or Settings.stopped then return end
+	if Settings.stopped then return end
+	-- allow saves once the shell exists; only skip during the very first construction frames
+	if Settings.loading and not Settings._allowEarlySave then return end
 	pcall(function()
 		local ok, snap = pcall(Settings.snapshot)
 		if not ok or type(snap) ~= "table" then return end
 		local ok2, text = pcall(function() return HttpService:JSONEncode(snap) end)
-		if not ok2 or text == Settings.lastText then return end -- nothing changed: no disk write
+		if not ok2 or text == Settings.lastText then return end
 		if Settings.writeJson(Settings.file, snap) then Settings.lastText = text end
 	end)
 end
@@ -11005,8 +11040,7 @@ do
 			end)
 		end
 		if data.fly == true then whenReady(function() HK.fly.set(true) end) end
-		-- Fruit farm is session-only: never auto-start after kick / leave / rejoin
-		-- (old saves may still have macro=true; ignore it)
+		-- Fruit farm is session-only (ignore saved macro after kick/leave/rejoin)
 	end
 end
 -- ====================== BOSSES: home box + Bosses page + live tracker ======================
@@ -11728,6 +11762,7 @@ xpcall(function()
 	local cards = {}
 	local function buildBossCard(i, b)
 		local card = createCard(CARD_H, (b.group == "beast" and 200 or 10) + i, BossesScroll)
+		if Settings.themeSubtree then pcall(Settings.themeSubtree, card) end
 		local c = { card = card, kind = nil, expanded = false }
 
 		-- status dot (LEFT of the name) with a soft pulsing halo
@@ -12889,6 +12924,7 @@ xpcall(function()
 	local function buildQuestCard(i, q)
 		local orderBase = (q.cat == "One-time" and 10) or (q.cat == "Repeatable" and 100) or (q.sec == "quest" and 1000) or (q.sec == "train" and 2000) or (q.sec == "shop" and 3000) or (q.cat == "Clan Progression" and 150) or (q.cat == "Boss Access" and 200) or (q.cat == "Clan" and 300) or 400
 		local card = createCard(CARD_H, orderBase + i, QuestsScroll)
+		if Settings.themeSubtree then pcall(Settings.themeSubtree, card) end
 		local c = { card = card, expanded = false }
 		local SIMPLE = not SHOW_SETUP_UI
 		local WPL = q.setup and "SET WP" or "SET MARKER"
@@ -13659,6 +13695,10 @@ xpcall(function()
 				end
 				if i % 3 == 0 then task.wait() end
 			end
+			task.wait(0.05)
+			pcall(function()
+				if refreshGuiLook then refreshGuiLook() end
+			end)
 		end)
 	end
 	Settings._ensureQuestCards = ensureQuestCards
@@ -14456,6 +14496,7 @@ xpcall(function()
 end, function(e) warn("[DannyGui] search bar error: " .. tostring(e)) end)
 
 Settings.loading = false
+Settings._allowEarlySave = true
 -- Theme pass after a frame so instance tree is settled
 task.defer(function()
 	task.wait(0.08)
